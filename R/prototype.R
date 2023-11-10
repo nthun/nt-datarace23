@@ -5,7 +5,7 @@ library(googledrive)
 library(tidymodels)
 library(censored)
 library(embed)
-library(finetune)
+# library(finetune)
 library(vip)
 
 
@@ -31,10 +31,11 @@ loan_raw <- read_csv("data/training_data.csv")
 loan <-
     loan_raw |> 
     # Get less data to try out models (remove this later!)
-    slice_sample(prop = .25) |> 
+    slice_sample(prop = .05) |> 
     mutate(TARGET_EVENT_DAY = if_else(TARGET_EVENT == "E", NA_real_, TARGET_EVENT_DAY),
            TARGET_EVENT = if_else(TARGET_EVENT == "K", 1L, 0L)) |> 
-    # mutate(surv = Surv(TARGET_EVENT_DAY, TARGET_EVENT), .keep = "unused") |> 
+    # Survival regression needs this new variable
+    mutate(surv = Surv(TARGET_EVENT_DAY, TARGET_EVENT), .keep = "unused") |>
     force()
 
 
@@ -59,10 +60,11 @@ loan_folds <- vfold_cv(loan_training, v = 5)
 
 # Feature engineering
 loan_rec <- 
-    recipe(surv ~ ., data = loan_training) |> 
+    recipe(surv ~ CONTRACT_INCOME + CONTRACT_INSTALMENT_AMOUNT + CONTRACT_INTEREST_RATE + CONTRACT_MARKET_VALUE, data = loan_training) |> 
     step_string2factor(all_string_predictors()) |> 
-    update_role(BORROWER_ID, new_role = "id") |> 
-    step_embed(CONTRACT_ID, outcome = TARGET_EVENT)
+    # update_role(BORROWER_ID, new_role = "id") |>
+    step_embed(BORROWER_ID, outcome = surv) |>
+    force()
     
 # Model spec
 bt_spec <- 
@@ -75,23 +77,49 @@ bt_spec <-
     set_engine("mboost")
 
 ph_spec <- 
-    proportional_hazards(penalty = tune(), mixture = 1) |> 
+    proportional_hazards(penalty = .5, mixture = 1) |> 
     set_engine("glmnet") |> 
     set_mode("censored regression") 
 
 # Workflow
 loan_wf <- 
-    workflow(preprocessor = loan_rec,
-    spec = bt_spec)
+    workflow() |>
+    add_recipe(loan_rec) |> 
+    add_model(ph_spec)
 
 # Fit model
 set.seed(345)
+
+ph_plain <- 
+    fit(loan_wf, loan_training)
+
+extract_fit_parsnip(ph_plain)
+
+ph_plain |> 
+roc_auc_survival() |> 
+    roc_auc()
+
+predict(ph_plain, loan_training, type = "linear_pred") |> 
+    pull() |> 
+    qplot()
+
+predict(
+    ph_plain, 
+    loan_training, 
+    type = "survival",
+    eval_time = c(100, 500, 1000)) |> 
+    slice(1) |> 
+    unnest(col = .pred)
+
+augment(ph_plain, loan_training, type = "linear_pred", eval_time = seq(0, 1500, 50))
+
+plain_fit <- fit_resamples(loan_wf, loan_folds, eval_time = seq(0, 1500, 50))
 
 ph_fit <- 
     ph_spec |> 
     tune_grid(surv ~ ., 
               grid = 5,
-              eval_time = 20,
+              # eval_time = 20,
               resamples = loan_folds)
 
 bt_fit <- 
